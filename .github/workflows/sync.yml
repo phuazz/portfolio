@@ -1,0 +1,84 @@
+name: Sync portfolio page
+
+# Pulls the built page from phuazz/breadth-thrust-etf and republishes it here.
+#
+# PULL, NOT PUSH. The source repo could push here instead, but that needs a
+# deploy key or a PAT living as a secret in a repo that runs a lot of scheduled
+# automation. Pulling runs on this repo's own GITHUB_TOKEN, so no standing
+# cross-repo credential exists at all. The cost is up to a day of lag on a book
+# that rebalances weekly; workflow_dispatch covers the case where that matters.
+#
+# The source repo builds the page under a guard (tests/test_simple_page_parity)
+# but nothing there knows what THIS repo has already published, so the fetched
+# file is re-validated here before it replaces anything — including the check a
+# structural test cannot make, that the as-of date never moves backwards.
+
+on:
+  schedule:
+    # 23:00 UTC = 07:00 SGT. The source dashboard rebuilds Mon-Fri at 21:30 UTC
+    # and the weekly refresh lands Saturday, so a daily pull after the rebuild
+    # catches both without guessing which day matters.
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-portfolio
+  cancel-in-progress: false
+
+env:
+  SOURCE_URL: https://raw.githubusercontent.com/phuazz/breadth-thrust-etf/main/build/portfolio.html
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch the built page
+        run: |
+          set -euo pipefail
+          # --fail turns an HTTP error into a non-zero exit instead of writing
+          # the error body into the page, which would then be published.
+          curl --fail --silent --show-error --location \
+               --retry 3 --retry-delay 5 --max-time 60 \
+               -o candidate.html "$SOURCE_URL"
+          echo "fetched $(wc -c < candidate.html) bytes"
+
+      - name: Validate before publishing
+        run: python scripts/validate.py candidate.html index.html
+
+      - name: Publish if changed
+        run: |
+          set -euo pipefail
+          if cmp -s candidate.html index.html; then
+            echo "No change — page already current."
+            rm -f candidate.html
+            exit 0
+          fi
+          mv candidate.html index.html
+          git config --local user.email "actions@github.com"
+          git config --local user.name "Portfolio Sync Bot"
+          git add index.html
+          git commit -m "Sync portfolio page $(date -u +%Y-%m-%d)"
+          git push origin HEAD:main
+          echo "Published."
+
+      # A pull-based sync fails silently by design — nothing downstream notices
+      # that the page simply stopped updating. This makes a stalled or rejected
+      # sync visible in the Actions tab rather than only in a log nobody opens.
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "::error title=Portfolio sync failed::The published page was left"\
+               "untouched. Check the validate step: a rejection is deliberate"\
+               "(truncated fetch, missing disclosure, or an as-of older than the"\
+               "one already published), not a flake to re-run blindly."
