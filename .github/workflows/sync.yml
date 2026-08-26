@@ -43,6 +43,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The validator is the only check standing between a wrong page and a
+      # published one, so it is itself checked before it is trusted — a bound
+      # that has drifted out of calibration fails here rather than by silently
+      # refusing a correct page, which is how 2026-08-22 was lost.
+      - name: Check the validator itself
+        run: python scripts/validate.py --selftest
+
       - name: Fetch the built page
         run: |
           set -euo pipefail

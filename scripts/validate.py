@@ -11,6 +11,7 @@ backwards one.
 
 Usage:
     python scripts/validate.py <candidate.html> [<currently-published.html>]
+    python scripts/validate.py --selftest
 
 Exit 0 to publish, 1 to keep what is already there.
 """
@@ -38,7 +39,30 @@ REQUIRED_TEXT = (
     "not investment advice",
 )
 
-WEIGHT_TOLERANCE = 1e-6
+# The source publishes every weight ROUNDED TO SIX DECIMALS, so a sum over n of
+# them carries up to n * 5e-7 of rounding that is present in the page and absent
+# from the book behind it. A fixed 1e-6 ignored that and was wrong by
+# construction: on 2026-08-22 strategy_a's six holdings (0.10247 + 0.082312 +
+# 0.060124 + 0.05337 + 0.043641 + 0.008084) summed to 0.350001 against a 0.35
+# target, the sleeve weight is derived from that sum, and the sync refused a
+# correct page for four days over one part in a million.
+#
+# Worse, it was a knife-edge rather than a clean failure. Both totals carry the
+# same 1e-6 excess, but `sum(holdings)` accumulates to 1.000001 and
+# `sum(sleeves)` to 1.0000010000000001, so only the second cleared the
+# threshold. Which check fired was decided by float accumulation order.
+#
+# Derive the bound from the publishing precision and the count instead, so it
+# stays calibrated when a holding is added. The construction faults this guard
+# exists for — a dropped sleeve, an unnormalised book — are off by percentage
+# points, several hundred times this bound, and are still caught.
+WEIGHT_DECIMALS = 6
+FLOAT_SLACK = 1e-9
+
+
+def weight_tolerance(n: int) -> float:
+    """Largest sum error attributable to publishing n weights rounded to 6 dp."""
+    return n * 0.5 * 10 ** -WEIGHT_DECIMALS + FLOAT_SLACK
 
 
 class Rejected(RuntimeError):
@@ -86,13 +110,20 @@ def check_payload(payload: dict) -> str:
         raise Rejected("no holdings — an empty book is never correct here")
 
     total = sum(h.get("weight", 0) for h in holdings)
-    if abs(total - 1.0) > WEIGHT_TOLERANCE:
-        raise Rejected(f"holdings sum to {total:.8f}, not 1.0")
+    tol = weight_tolerance(len(holdings))
+    if abs(total - 1.0) > tol:
+        raise Rejected(f"holdings sum to {total:.8f}, not 1.0 (tolerance {tol:.2e})")
 
     sleeves = payload.get("sleeves") or []
+    if not sleeves:
+        raise Rejected("no sleeve split — the book must say how it divides")
+    # A sleeve weight is the sum of its holdings and may then be rounded again,
+    # so the sleeve total inherits the holdings' rounding and adds its own.
     sleeve_total = sum(s.get("weight", 0) for s in sleeves)
-    if not sleeves or abs(sleeve_total - 1.0) > WEIGHT_TOLERANCE:
-        raise Rejected(f"sleeve split sums to {sleeve_total:.8f}, not 1.0")
+    sleeve_tol = weight_tolerance(len(holdings) + len(sleeves))
+    if abs(sleeve_total - 1.0) > sleeve_tol:
+        raise Rejected(f"sleeve split sums to {sleeve_total:.8f}, not 1.0 "
+                       f"(tolerance {sleeve_tol:.2e})")
 
     if any(not h.get("name") for h in holdings):
         raise Rejected("a holding has no fund name")
@@ -137,7 +168,61 @@ def check_not_going_backwards(new_as_of: str, published: Path | None) -> str:
     return f"as-of advances {old_as_of} -> {new_as_of}"
 
 
+def _selftest() -> int:
+    """Pin the weight bound in BOTH directions, with no test dependency.
+
+    A tolerance is only a guard while it is calibrated. The 2026-08-22 failure
+    was a bound too tight to admit the page's own published precision; the
+    obvious repair — widen it until the red goes away — would have left a bound
+    nobody could argue for and a real unnormalised book able to slip through.
+    So both edges are pinned: rounding at the published precision must pass, a
+    construction fault must still be refused.
+    """
+    def book(weights, sleeves):
+        return {"as_of": "2026-01-02",
+                "holdings": [{"name": f"F{i}", "weight": w}
+                             for i, w in enumerate(weights)],
+                "sleeves": [{"weight": w} for w in sleeves],
+                "curve": {"dates": ["2026-01-02"], "equity": [1.0]}}
+
+    cases = []
+    # The real 2026-08-22 page: 22 holdings at 6 dp summing to 1.000001.
+    real = [0.10247, 0.1, 0.082312, 0.075, 0.0648, 0.0602, 0.060124, 0.05337,
+            0.0445, 0.043641, 0.040525, 0.03855, 0.038225, 0.031875, 0.02925,
+            0.027075, 0.02, 0.02, 0.02, 0.02, 0.02, 0.008084]
+    cases.append(("6-dp rounding at the real book size", True,
+                  book(real, [0.350001, 0.25, 0.1, 0.2, 0.1])))
+    # Worst-case rounding drift the bound is sized for must still pass.
+    drift = [round(1.0 / 22 + 4.9e-7, 6)] * 21
+    drift.append(round(1.0 - sum(drift), 6))
+    cases.append(("worst-case 6-dp drift", True, book(drift, [1.0])))
+    # Construction faults, which are orders of magnitude larger, must reject.
+    cases.append(("a sleeve silently dropped", False,
+                  book(real, [0.350001, 0.25, 0.1, 0.2])))
+    cases.append(("book unnormalised by 1%", False,
+                  book([w * 1.01 for w in real], [1.0])))
+    cases.append(("no sleeve split at all", False, book(real, [])))
+
+    failures = 0
+    for name, should_pass, payload in cases:
+        try:
+            check_payload(payload)
+            passed = True
+            why = ""
+        except Rejected as exc:
+            passed, why = False, str(exc)
+        ok = passed == should_pass
+        failures += not ok
+        verdict = "ok  " if ok else "FAIL"
+        print(f"  {verdict} {name}: "
+              f"{'accepted' if passed else 'refused'}{' — ' + why if why else ''}")
+    print(f"selftest: {len(cases) - failures}/{len(cases)} passed")
+    return 1 if failures else 0
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[1] == "--selftest":
+        return _selftest()
     if not 2 <= len(argv) <= 3:
         print(__doc__)
         return 2
